@@ -1,0 +1,34 @@
+[package]
+name = "etapa1"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+env_logger = "0.10.0"
+mio = { version = "0.8", features = ["net", "os-poll"] }
+fastrand = "1.4.0"
+futures = "~0.3.5"
+futures-lite = "1.11.1"
+tokio-amqp = "2.0.0"
+redis = "0.22.3"
+amiquip = "0.4.2"
+serde_json = "1.0"
+
+aws-config= { version = "1.8.1", features = ["behavior-version-latest"] }
+aws-sdk-sqs= { version = "1.74.0"}
+dotenv = "0.15"
+lapin = "2.0.3"
+
+[dependencies.tokio]
+version = "1.20.1"
+features = ["full"]
+
+[dependencies.clap]
+version = "4.4"
+features = ["derive"]
+
+[dependencies.tracing-subscriber]
+version = "0.3.15"
+features = ["env-filter"]
