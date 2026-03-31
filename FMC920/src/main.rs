@@ -8,6 +8,8 @@ use std::sync::mpsc::{self};
 
 use redis;
 use redis::Commands;
+use r2d2_redis::RedisConnectionManager;
+use r2d2::Pool;
 
 use std::time::Instant;
 use std::error::Error;
@@ -108,24 +110,40 @@ async fn worker_sqs(rx: std::sync::mpsc::Receiver<String>) {
     }
 }
 
-#[instrument(skip(redis_conn))]
-fn get_device_auth(redis_conn: &mut redis::Connection, imei: &str) -> Result<String, Box<dyn Error>> {
-    redis_conn.get(imei)
+#[instrument(skip(pool))]
+fn get_device_auth(pool: &Pool<RedisConnectionManager>, imei: &str) -> Result<String, Box<dyn Error>> {
+    let mut conn = pool.get().map_err(|e| {
+        error!(imei = imei, error = %e, "Failed to get Redis connection from pool");
+        Box::new(e) as Box<dyn Error>
+    })?;
+    conn.get(imei)
         .map_err(|e| {
             error!(imei = imei, error = %e, "Failed to get device from Redis");
             Box::new(e) as Box<dyn Error>
         })
 }
 
-#[instrument(skip(redis_conn, json))]
+#[instrument(skip(pool, json))]
 fn save_last_transmission(
-    redis_conn: &mut redis::Connection,
+    pool: &Pool<RedisConnectionManager>,
     imei: &str,
     json: &Value,
 ) -> Result<(), Box<dyn Error>> {
-    let latitude = json.get("latitude").unwrap_or(&Value::from(0.0)).clone();
-    let longitude = json.get("longitude").unwrap_or(&Value::from(0.0)).clone();
-    let ignition_status = json.get("239").unwrap_or(&Value::from(0)).clone();
+    let reported = &json["state"]["reported"];
+
+    let (latitude, longitude) = reported
+        .get("latlng")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.split_once(','))
+        .map(|(lat, lng)| {
+            (
+                lat.parse::<f64>().unwrap_or(0.0),
+                lng.parse::<f64>().unwrap_or(0.0),
+            )
+        })
+        .unwrap_or((0.0, 0.0));
+
+    let ignition_status = reported.get("239").unwrap_or(&Value::from(0)).clone();
 
     let json_data = json!({
         "imei": Value::String(imei.to_string()),
@@ -137,7 +155,11 @@ fn save_last_transmission(
 
     let key = format!("{}/last_transmission", imei);
     
-    redis_conn.set(&key, json_data.to_string())
+    let mut conn = pool.get().map_err(|e| {
+        error!(imei = imei, error = %e, "Failed to get Redis connection from pool");
+        Box::new(e) as Box<dyn Error>
+    })?;
+    conn.set(&key, json_data.to_string())
         .map_err(|e| {
             error!(imei = imei, key = &key, error = %e, "Failed to save last_transmission");
             Box::new(e) as Box<dyn Error>
@@ -175,14 +197,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut devices: HashMap<Token, String> = HashMap::new();
     let mut buffer = [0_u8; BUFFER_SIZE];
 
-    // Load Redis connection from .env
+    // Load Redis pool from .env
     let redis_url = env::var("REDIS_URL")
         .unwrap_or_else(|_| "redis://localhost:6379/".to_string());
     
-    let redis_client = redis::Client::open(redis_url.clone())?;
-    let mut redis_conn = redis_client.get_connection()?;
+    let manager = RedisConnectionManager::new(redis_url.clone())?;
+    let redis_pool = Pool::builder()
+        .max_size(16)
+        .min_idle(Some(2))
+        .build(manager)?;
     
-    info!(redis_url = ?redis_url, "Connected to Redis");
+    info!(redis_url = ?redis_url, "Redis connection pool created (max_size=16)");
 
     let mut events = Events::with_capacity(4096);
     let mut stats = (0u64, 0u64); // (processed, errors)
@@ -248,7 +273,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                                             .collect();
                                         
                                         devices.insert(token, cleaned_imei.clone());
-                                        debug!(token = ?token, imei = cleaned_imei, "IMEI registered");
+                                        info!(token = ?token, imei = cleaned_imei, "IMEI registered");
+
+                                        // Send ACK (0x01) to accept the device connection
+                                        if let Some(socket) = sockets.get_mut(&token) {
+                                            if let Err(e) = socket.write_all(&[0x01]) {
+                                                error!(token = ?token, error = %e, "Failed to send IMEI ACK");
+                                            } else {
+                                                debug!(token = ?token, "IMEI ACK sent");
+                                            }
+                                        }
                                     }
                                 } else {
                                     // Telemetry Data Phase
@@ -256,15 +290,23 @@ fn main() -> Result<(), Box<dyn Error>> {
                                         debug!(imei = device_str, "Processing telemetry");
 
                                         // Authentication & Processing
-                                        match get_device_auth(&mut redis_conn, device_str) {
+                                        match get_device_auth(&redis_pool, device_str) {
                                             Ok(device_id) if !device_id.is_empty() => {
-                                                let payload = request_str.trim_end_matches('\0');
+                                                let payload = request_str.trim_end_matches('\0').trim();
+
+                                                if payload.is_empty() {
+                                                    debug!(imei = device_str, "Empty payload received, skipping");
+                                                } else if !payload.starts_with('{') {
+                                                    debug!(imei = device_str, len = payload.len(), "Non-JSON payload received, skipping");
+                                                } else {
 
                                                 match serde_json::from_str::<Value>(payload) {
                                                     Ok(mut json) => {
                                                         if let Some(reported) = json["state"]["reported"].as_object_mut() {
                                                             reported.insert("imei".to_string(), Value::String(device_str.to_string()));
                                                         }
+
+                                                        
 
                                                         // Send to SQS (non-blocking)
                                                         let to_send = serde_json::to_string(&json)
@@ -282,8 +324,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                                                             }
                                                         }
 
+                                                        info!(imei = device_str, payload = %json, "Payload Received");
+
                                                         // Save last transmission
-                                                        if let Err(e) = save_last_transmission(&mut redis_conn, device_str, &json) {
+                                                        if let Err(e) = save_last_transmission(&redis_pool, device_str, &json) {
                                                             warn!(error = %e, "Failed to save transmission timestamp");
                                                         }
                                                     }
@@ -292,6 +336,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                                                         stats.1 += 1;
                                                     }
                                                 }
+
+                                                } // else (valid JSON payload)
                                             }
                                             Ok(_) => {
                                                 warn!(imei = device_str, "Device not authenticated");
@@ -341,7 +387,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                     if let Some(device_id) = devices.get(&token) {
                         let update_key = format!("{}/update", device_id);
 
-                        match redis_conn.lrange::<_, Vec<String>>(&update_key, 0, 100) {
+                        let lrange_result = redis_pool.get()
+                            .map_err(|e| redis::RedisError::from(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset, e.to_string()
+                            )))
+                            .and_then(|mut conn| conn.lrange::<_, Vec<String>>(&update_key, 0, 100));
+                        match lrange_result {
                             Ok(value) if !value.is_empty() => {
                                 if let Some(content_send) = value.first() {
                                     if let Some(socket) = sockets.get_mut(&token) {
@@ -354,15 +405,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                                         req.clear();
                                     }
 
-                                    // Remove from queue
-                                    if let Err(e) = redis_conn.rpop::<_, Option<String>>(&update_key, None) {
-                                        warn!(key = &update_key, error = %e, "Failed to RPOP");
-                                    }
+                                    // Remove from queue and set ACK
+                                    if let Ok(mut conn) = redis_pool.get() {
+                                        if let Err(e) = conn.rpop::<_, Option<String>>(&update_key, None) {
+                                            warn!(key = &update_key, error = %e, "Failed to RPOP");
+                                        }
 
-                                    // Set ACK flag
-                                    let verify_ack = format!("{}/verify_ack", device_id);
-                                    if let Err(e) = redis_conn.set::<_, _, ()>(&verify_ack, "1") {
-                                        warn!(key = &verify_ack, error = %e, "Failed to set ACK");
+                                        let verify_ack = format!("{}/verify_ack", device_id);
+                                        if let Err(e) = conn.set::<_, _, ()>(&verify_ack, "1") {
+                                            warn!(key = &verify_ack, error = %e, "Failed to set ACK");
+                                        }
+                                    } else {
+                                        error!("Failed to get Redis connection from pool for RPOP/ACK");
                                     }
                                 }
                             }
