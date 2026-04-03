@@ -8,8 +8,8 @@ use std::sync::mpsc::{self};
 
 use redis;
 use redis::Commands;
-use r2d2_redis::RedisConnectionManager;
-use r2d2::Pool;
+
+type RedisPool = r2d2::Pool<redis::Client>;
 
 use std::time::Instant;
 use std::error::Error;
@@ -111,7 +111,7 @@ async fn worker_sqs(rx: std::sync::mpsc::Receiver<String>) {
 }
 
 #[instrument(skip(pool))]
-fn get_device_auth(pool: &Pool<RedisConnectionManager>, imei: &str) -> Result<String, Box<dyn Error>> {
+fn get_device_auth(pool: &RedisPool, imei: &str) -> Result<String, Box<dyn Error>> {
     let mut conn = pool.get().map_err(|e| {
         error!(imei = imei, error = %e, "Failed to get Redis connection from pool");
         Box::new(e) as Box<dyn Error>
@@ -125,7 +125,7 @@ fn get_device_auth(pool: &Pool<RedisConnectionManager>, imei: &str) -> Result<St
 
 #[instrument(skip(pool, json))]
 fn save_last_transmission(
-    pool: &Pool<RedisConnectionManager>,
+    pool: &RedisPool,
     imei: &str,
     json: &Value,
 ) -> Result<(), Box<dyn Error>> {
@@ -201,11 +201,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let redis_url = env::var("REDIS_URL")
         .unwrap_or_else(|_| "redis://localhost:6379/".to_string());
     
-    let manager = RedisConnectionManager::new(redis_url.clone())?;
-    let redis_pool = Pool::builder()
+    let redis_client = redis::Client::open(redis_url.clone())?;
+    let redis_pool = r2d2::Pool::builder()
         .max_size(16)
         .min_idle(Some(2))
-        .build(manager)?;
+        .build(redis_client)?;
     
     info!(redis_url = ?redis_url, "Redis connection pool created (max_size=16)");
 
@@ -387,11 +387,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     if let Some(device_id) = devices.get(&token) {
                         let update_key = format!("{}/update", device_id);
 
-                        let lrange_result = redis_pool.get()
-                            .map_err(|e| redis::RedisError::from(std::io::Error::new(
+                        let lrange_result: Result<Vec<String>, redis::RedisError> = redis_pool.get()
+                            .map_err(|e: r2d2::Error| redis::RedisError::from(std::io::Error::new(
                                 std::io::ErrorKind::ConnectionReset, e.to_string()
                             )))
-                            .and_then(|mut conn| conn.lrange::<_, Vec<String>>(&update_key, 0, 100));
+                            .and_then(|mut conn: r2d2::PooledConnection<redis::Client>| conn.lrange(&update_key, 0, 100));
                         match lrange_result {
                             Ok(value) if !value.is_empty() => {
                                 if let Some(content_send) = value.first() {
@@ -407,7 +407,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                                     // Remove from queue and set ACK
                                     if let Ok(mut conn) = redis_pool.get() {
-                                        if let Err(e) = conn.rpop::<_, Option<String>>(&update_key, None) {
+                                        if let Err(e) = redis::cmd("RPOP").arg(&update_key).query::<Option<String>>(&mut *conn) {
                                             warn!(key = &update_key, error = %e, "Failed to RPOP");
                                         }
 
