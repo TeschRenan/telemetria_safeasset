@@ -177,6 +177,13 @@ async fn flush_pending_updates(socket: &mut TcpStream, redis: &mut ConnectionMan
     }
 }
 
+fn extract_imei(payload: &str) -> Option<String> {
+    let dollar_idx = payload.find('$').unwrap_or(payload.len());
+    let parts: Vec<&str> = payload[..dollar_idx].split(',').collect();
+    let imei = parts.get(2).map(|s| s.trim().to_string()).filter(|s| s.len() == 15 && s.chars().all(|c| c.is_ascii_digit()));
+    imei
+}
+
 async fn handle_connection(
     mut socket: TcpStream,
     addr:       SocketAddr,
@@ -185,48 +192,25 @@ async fn handle_connection(
     stats:      Arc<Stats>,
 ) {
     stats.active.fetch_add(1, Ordering::Relaxed);
-    let _guard = ActiveGuard(stats.clone()); // garante decremento em qualquer return
+    let _guard = ActiveGuard(stats.clone());
 
     info!(remote_addr = %addr, "New connection accepted");
 
-    let mut buffer = [0u8; BUFFER_SIZE];
-
-    // --- Fase 1: leitura do IMEI ---
-    let n = match socket.read(&mut buffer).await {
-        Ok(0) | Err(_) => return,
-        Ok(n) => n,
-    };
-
-    let raw            = std::str::from_utf8(&buffer[..n]).unwrap_or("");
-    let alphanumeric   = raw.chars().filter(|c| c.is_alphanumeric()).count();
-
-    if alphanumeric != 15 {
-        debug!(remote_addr = %addr, "Invalid IMEI length, dropping connection");
-        return;
-    }
-
-    let imei: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
-    info!(imei = %imei, "IMEI registered");
-
-    // --- Fase 2: ACK ---
-    if let Err(e) = socket.write_all(&[0x01]).await {
-        error!(imei = %imei, error = %e, "Failed to send ACK");
-        return;
-    }
-    debug!(imei = %imei, "ACK sent");
-
-    // --- Fase 3: loop de payloads Queclink (mensagens terminam em '$') ---
+    let mut buffer     = [0u8; BUFFER_SIZE];
     let mut request_buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut imei: Option<String> = None;
 
+    // Queclink GV350 envia mensagens AT diretamente — sem handshake de IMEI.
+    // O IMEI é extraído de parts[2] da primeira mensagem válida.
     loop {
         let n = match socket.read(&mut buffer).await {
-            Ok(0) => { debug!(imei = %imei, "Connection closed by device"); break; }
+            Ok(0) => { debug!(remote_addr = %addr, "Connection closed by device"); break; }
             Ok(n) => n,
-            Err(e) => { error!(imei = %imei, error = %e, "Read error"); break; }
+            Err(e) => { error!(remote_addr = %addr, error = %e, "Read error"); break; }
         };
 
         if request_buf.len() + n > MAX_REQUEST_SIZE {
-            error!(imei = %imei, "Request buffer overflow");
+            error!(remote_addr = %addr, "Request buffer overflow");
             break;
         }
         request_buf.extend_from_slice(&buffer[..n]);
@@ -246,17 +230,33 @@ async fn handle_connection(
             }
 
             if payload_str.contains("+ACK") {
-                debug!(imei = %imei, "ACK message ignored");
+                debug!(remote_addr = %addr, "ACK message ignored");
                 continue;
             }
 
             if !payload_str.contains("+RESP") && !payload_str.contains("+BUF") {
-                debug!(imei = %imei, payload = %payload_str, "Unknown message format, skipping");
+                debug!(remote_addr = %addr, payload = %payload_str, "Unknown message format, skipping");
                 continue;
             }
 
+            // Extrai o IMEI da primeira mensagem válida e mantém para as demais
+            if imei.is_none() {
+                match extract_imei(&payload_str) {
+                    Some(extracted) => {
+                        info!(remote_addr = %addr, imei = %extracted, "IMEI identified from first message");
+                        imei = Some(extracted);
+                    }
+                    None => {
+                        warn!(remote_addr = %addr, payload = %payload_str, "Could not extract IMEI, skipping");
+                        continue;
+                    }
+                }
+            }
+
+            let imei = imei.as_deref().unwrap();
+
             // Guard rail: autenticação re-verificada a cada payload
-            let device_id = get_device_auth(&mut redis, &imei).await;
+            let device_id = get_device_auth(&mut redis, imei).await;
             if device_id.is_empty() {
                 warn!(imei = %imei, "Device not authorized");
                 stats.errors.fetch_add(1, Ordering::Relaxed);
@@ -266,15 +266,15 @@ async fn handle_connection(
             info!(imei = %imei, payload = %payload_str, "Payload received");
 
             // Atualiza ign_status no Redis apenas para GTIGN e GTIGF
-            update_ignition_status(&mut redis, &imei, &payload_str).await;
+            update_ignition_status(&mut redis, imei, &payload_str).await;
 
             // Salva last_transmission no Redis apenas para GTERI
-            if let Err(e) = save_last_transmission(&mut redis, &imei, &payload_str).await {
+            if let Err(e) = save_last_transmission(&mut redis, imei, &payload_str).await {
                 warn!(imei = %imei, error = %e, "Failed to save last transmission");
             }
 
             // Lê ignição atual do Redis para compor o envelope SQS
-            let ign_status = get_ignition_status(&mut redis, &imei).await;
+            let ign_status = get_ignition_status(&mut redis, imei).await;
 
             let to_send = json!({
                 "ignition": ign_status,
@@ -289,7 +289,7 @@ async fn handle_connection(
                 stats.errors.fetch_add(1, Ordering::Relaxed);
             }
 
-            flush_pending_updates(&mut socket, &mut redis, &imei).await;
+            flush_pending_updates(&mut socket, &mut redis, imei).await;
         }
     }
 }
