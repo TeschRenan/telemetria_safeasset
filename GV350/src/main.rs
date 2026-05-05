@@ -130,9 +130,10 @@ fn parse_gteri_lat_lon(payload: &str) -> Option<(f64, f64)> {
 }
 
 async fn save_last_transmission(
-    redis:   &mut ConnectionManager,
-    imei:    &str,
-    payload: &str,
+    redis:          &mut ConnectionManager,
+    imei:           &str,
+    payload:        &str,
+    ignition_status: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     if !payload.contains("GTERI") {
         return Ok(());
@@ -144,6 +145,7 @@ async fn save_last_transmission(
         "imei":              imei,
         "latitude":          latitude,
         "longitude":         longitude,
+        "ignition_status":   ignition_status,
         "last_transmission": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     });
 
@@ -268,13 +270,13 @@ async fn handle_connection(
             // Atualiza ign_status no Redis apenas para GTIGN e GTIGF
             update_ignition_status(&mut redis, imei, &payload_str).await;
 
+            // Lê ignição atual do Redis (após possível atualização acima)
+            let ign_status = get_ignition_status(&mut redis, imei).await;
+
             // Salva last_transmission no Redis apenas para GTERI
-            if let Err(e) = save_last_transmission(&mut redis, imei, &payload_str).await {
+            if let Err(e) = save_last_transmission(&mut redis, imei, &payload_str, &ign_status).await {
                 warn!(imei = %imei, error = %e, "Failed to save last transmission");
             }
-
-            // Lê ignição atual do Redis para compor o envelope SQS
-            let ign_status = get_ignition_status(&mut redis, imei).await;
 
             let to_send = json!({
                 "ignition": ign_status,
