@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::path::Path;
+use std::fs;
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,6 +22,7 @@ use dotenv::from_filename;
 
 use chrono::Utc;
 use tracing::{error, warn, info, debug};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const MAX_REQUEST_SIZE: usize = 65536;
 const BUFFER_SIZE: usize = 2048;
@@ -202,7 +204,11 @@ async fn handle_connection(
 
         let payload_str = match std::str::from_utf8(&request_buf) {
             Ok(s) => s.trim_end_matches('\0').trim().to_string(),
-            Err(_) => continue,
+            Err(_) => {
+                warn!(imei = %imei, buffer_len = request_buf.len(), "Binary data received — clearing buffer");
+                request_buf.clear();
+                continue;
+            }
         };
 
         if payload_str.is_empty() || !payload_str.starts_with('{') {
@@ -251,13 +257,46 @@ async fn handle_connection(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_target(true)
-        .with_thread_ids(true)
+    let log_dir = env::var("LOG_DIR").unwrap_or_else(|_| "./logs".to_string());
+    fs::create_dir_all(&log_dir)?;
+
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "fmc150.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::filter::LevelFilter::INFO)
+        .with(tracing_subscriber::fmt::layer().with_target(true).with_thread_ids(true))
+        .with(tracing_subscriber::fmt::layer().with_target(true).with_thread_ids(true).with_writer(non_blocking))
         .init();
 
-    info!("Starting FMC920 TCP Server");
+    // Task de limpeza: remove arquivos de log com mais de 7 dias a cada 24h
+    {
+        let log_dir_clone = log_dir.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(86400));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let cutoff = std::time::SystemTime::now()
+                    .checked_sub(Duration::from_secs(7 * 86400))
+                    .unwrap();
+                if let Ok(entries) = fs::read_dir(&log_dir_clone) {
+                    for entry in entries.flatten() {
+                        if let Ok(meta) = entry.metadata() {
+                            if let Ok(modified) = meta.modified() {
+                                if modified < cutoff {
+                                    let _ = fs::remove_file(entry.path());
+                                    info!(file = ?entry.path(), "Old log file removed");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    info!("Starting FMC150 TCP Server");
 
     from_filename(Path::new(".env")).ok();
 

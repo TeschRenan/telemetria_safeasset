@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::path::Path;
+use std::fs;
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,6 +22,7 @@ use dotenv::from_filename;
 
 use chrono::Utc;
 use tracing::{error, warn, info, debug};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const MAX_REQUEST_SIZE: usize = 65536;
 const BUFFER_SIZE: usize = 2048;
@@ -128,7 +130,9 @@ async fn flush_pending_updates(socket: &mut TcpStream, redis: &mut ConnectionMan
     let values: Result<Vec<String>, _> = redis.lrange(&update_key, 0, 100).await;
     match values {
         Ok(list) if !list.is_empty() => {
+            info!(imei = %imei, pending = list.len(), "Pending commands found");
             if let Some(content) = list.first() {
+                info!(imei = %imei, command = %content, "Sending command to device");
                 if let Err(e) = socket.write_all(content.as_bytes()).await {
                     error!(imei = %imei, error = %e, "Failed to write update to device");
                     return;
@@ -139,6 +143,7 @@ async fn flush_pending_updates(socket: &mut TcpStream, redis: &mut ConnectionMan
                     .await;
                 let verify_key = format!("{}/verify_ack", imei);
                 let _: Result<(), _> = redis.set::<_, _, ()>(&verify_key, "1").await;
+                info!(imei = %imei, command = %content, "Command sent and verify_ack set");
             }
         }
         Ok(_)  => debug!(imei = %imei, "No pending updates"),
@@ -147,16 +152,25 @@ async fn flush_pending_updates(socket: &mut TcpStream, redis: &mut ConnectionMan
 }
 
 async fn handle_connection(
-    mut socket: TcpStream,
-    addr:       SocketAddr,
-    mut redis:  ConnectionManager,
-    sqs_tx:     mpsc::UnboundedSender<String>,
-    stats:      Arc<Stats>,
+    mut socket:   TcpStream,
+    addr:         SocketAddr,
+    redis_client: Arc<redis::Client>,
+    sqs_tx:       mpsc::UnboundedSender<String>,
+    stats:        Arc<Stats>,
 ) {
     stats.active.fetch_add(1, Ordering::Relaxed);
-    let _guard = ActiveGuard(stats.clone()); // garante decremento em qualquer return
+    let _guard = ActiveGuard(stats.clone());
 
     info!(remote_addr = %addr, "New connection accepted");
+
+    // Conexão Redis dedicada para este handler — sem contenção com outros dispositivos
+    let mut redis = match ConnectionManager::new((*redis_client).clone()).await {
+        Ok(cm) => cm,
+        Err(e) => {
+            error!(remote_addr = %addr, error = %e, "Failed to create Redis connection");
+            return;
+        }
+    };
 
     let mut buffer = [0u8; BUFFER_SIZE];
 
@@ -166,8 +180,8 @@ async fn handle_connection(
         Ok(n) => n,
     };
 
-    let raw            = std::str::from_utf8(&buffer[..n]).unwrap_or("");
-    let alphanumeric   = raw.chars().filter(|c| c.is_alphanumeric()).count();
+    let raw          = std::str::from_utf8(&buffer[..n]).unwrap_or("");
+    let alphanumeric = raw.chars().filter(|c| c.is_alphanumeric()).count();
 
     if alphanumeric != 15 {
         debug!(remote_addr = %addr, "Invalid IMEI length, dropping connection");
@@ -184,6 +198,13 @@ async fn handle_connection(
     }
     debug!(imei = %imei, "ACK sent");
 
+    // --- Autenticação: feita uma única vez por conexão ---
+    let device_id = get_device_auth(&mut redis, &imei).await;
+    if device_id.is_empty() {
+        warn!(imei = %imei, "Device not authorized, closing connection");
+        return;
+    }
+
     // --- Fase 3: loop de payloads ---
     let mut request_buf: Vec<u8> = Vec::with_capacity(4096);
 
@@ -195,14 +216,24 @@ async fn handle_connection(
         };
 
         if request_buf.len() + n > MAX_REQUEST_SIZE {
-            error!(imei = %imei, "Request buffer overflow");
-            break;
+            let preview = std::str::from_utf8(&request_buf)
+                .unwrap_or("<binary>")
+                .chars()
+                .take(200)
+                .collect::<String>();
+            error!(imei = %imei, buffer_len = request_buf.len(), preview = %preview, "Request buffer overflow — clearing and continuing");
+            request_buf.clear();
+            continue;
         }
         request_buf.extend_from_slice(&buffer[..n]);
 
         let payload_str = match std::str::from_utf8(&request_buf) {
             Ok(s) => s.trim_end_matches('\0').trim().to_string(),
-            Err(_) => continue,
+            Err(_) => {
+                warn!(imei = %imei, buffer_len = request_buf.len(), "Binary data received — clearing buffer");
+                request_buf.clear();
+                continue;
+            }
         };
 
         if payload_str.is_empty() || !payload_str.starts_with('{') {
@@ -218,14 +249,6 @@ async fn handle_connection(
                     reported.insert("imei".to_string(), Value::String(imei.clone()));
                 }
 
-                // Guard rail: autenticação re-verificada a cada payload
-                let device_id = get_device_auth(&mut redis, &imei).await;
-                if device_id.is_empty() {
-                    warn!(imei = %imei, "Device not authorized");
-                    stats.errors.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-
                 info!(imei = %imei, payload = %json, "Payload Received");
 
                 let to_send = serde_json::to_string(&json).unwrap_or_default();
@@ -238,11 +261,22 @@ async fn handle_connection(
                     }
                 }
 
-                if let Err(e) = save_last_transmission(&mut redis, &imei, &json).await {
-                    warn!(imei = %imei, error = %e, "Failed to save last transmission");
+                match tokio::time::timeout(
+                    Duration::from_secs(3),
+                    save_last_transmission(&mut redis, &imei, &json),
+                ).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!(imei = %imei, error = %e, "Redis save_last_transmission failed"),
+                    Err(_)     => warn!(imei = %imei, "Redis save_last_transmission timed out"),
                 }
 
-                flush_pending_updates(&mut socket, &mut redis, &imei).await;
+                match tokio::time::timeout(
+                    Duration::from_secs(3),
+                    flush_pending_updates(&mut socket, &mut redis, &imei),
+                ).await {
+                    Ok(()) => {}
+                    Err(_) => warn!(imei = %imei, "flush_pending_updates timed out"),
+                }
             }
             Err(_) => {} // JSON incompleto: continua acumulando
         }
@@ -251,21 +285,53 @@ async fn handle_connection(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_target(true)
-        .with_thread_ids(true)
+    let log_dir = env::var("LOG_DIR").unwrap_or_else(|_| "./logs".to_string());
+    fs::create_dir_all(&log_dir)?;
+
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "fmc920.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::filter::LevelFilter::INFO)
+        .with(tracing_subscriber::fmt::layer().with_target(true).with_thread_ids(true))
+        .with(tracing_subscriber::fmt::layer().with_target(true).with_thread_ids(true).with_writer(non_blocking))
         .init();
+
+    // Task de limpeza: remove arquivos de log com mais de 7 dias a cada 24h
+    {
+        let log_dir_clone = log_dir.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(86400));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let cutoff = std::time::SystemTime::now()
+                    .checked_sub(Duration::from_secs(7 * 86400))
+                    .unwrap();
+                if let Ok(entries) = fs::read_dir(&log_dir_clone) {
+                    for entry in entries.flatten() {
+                        if let Ok(meta) = entry.metadata() {
+                            if let Ok(modified) = meta.modified() {
+                                if modified < cutoff {
+                                    let _ = fs::remove_file(entry.path());
+                                    info!(file = ?entry.path(), "Old log file removed");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     info!("Starting FMC920 TCP Server");
 
     from_filename(Path::new(".env")).ok();
 
-    // Redis async — ConnectionManager é clonável e multiplexa sobre uma única conexão
+    // Redis — cada handler cria sua própria conexão dedicada (sem contenção)
     let redis_url    = env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379/".to_string());
-    let redis_client = redis::Client::open(redis_url.clone())?;
-    let redis        = ConnectionManager::new(redis_client).await?;
-    info!(redis_url = ?redis_url, "Redis async connection manager created");
+    let redis_client = Arc::new(redis::Client::open(redis_url.clone())?);
+    info!(redis_url = ?redis_url, "Redis client created");
 
     // Canal SQS async + task worker
     let (sqs_tx, sqs_rx) = mpsc::unbounded_channel::<String>();
@@ -307,7 +373,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 tokio::spawn(handle_connection(
                     socket,
                     addr,
-                    redis.clone(),
+                    redis_client.clone(),
                     sqs_tx.clone(),
                     stats.clone(),
                 ));
