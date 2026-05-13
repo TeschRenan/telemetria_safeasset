@@ -1,0 +1,25 @@
+[package]
+name = "etapa1"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+serde_json = "1.0"
+
+aws-config  = { version = "1.8.1", features = ["behavior-version-latest"] }
+aws-sdk-sqs = { version = "1.74.0" }
+dotenv      = "0.15"
+chrono      = "0.4.44"
+tracing     = "0.1.44"
+
+[dependencies.tokio]
+version  = "1.20.1"
+features = ["full"]
+
+[dependencies.tracing-subscriber]
+version  = "0.3.15"
+features = ["env-filter", "fmt"]
+
+[dependencies.tracing-appender]
+version = "0.2"
