@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::env;
 use std::net::SocketAddr;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -9,7 +10,10 @@ use std::fs;
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::timeout;
 use tokio::sync::mpsc;
+
+use socket2::{Socket, TcpKeepalive};
 
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
@@ -25,6 +29,21 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const MAX_REQUEST_SIZE: usize = 65536;
 const BUFFER_SIZE: usize = 2048;
+const IDLE_TIMEOUT: Duration = Duration::from_secs(600); // fecha conexão sem dados por 10 min
+
+fn apply_keepalive(stream: &TcpStream) {
+    let fd = stream.as_raw_fd();
+    // Safety: apenas configura opções no fd, sem transferir ownership
+    let socket = unsafe { Socket::from_raw_fd(fd) };
+    let ka = TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(10))
+        .with_retries(3);
+    if let Err(e) = socket.set_tcp_keepalive(&ka) {
+        warn!(error = %e, "Failed to set TCP keepalive");
+    }
+    std::mem::forget(socket);
+}
 
 struct Stats {
     processed: AtomicU64,
@@ -209,10 +228,18 @@ async fn handle_connection(
     // Queclink GV350 envia mensagens AT diretamente — sem handshake de IMEI.
     // O IMEI é extraído de parts[2] da primeira mensagem válida.
     loop {
-        let n = match socket.read(&mut buffer).await {
-            Ok(0) => { debug!(remote_addr = %addr, "Connection closed by device"); break; }
-            Ok(n) => n,
-            Err(e) => { error!(remote_addr = %addr, error = %e, "Read error"); break; }
+        let n = match timeout(IDLE_TIMEOUT, socket.read(&mut buffer)).await {
+            Ok(Ok(0)) => { debug!(remote_addr = %addr, "Connection closed by device"); break; }
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                if e.raw_os_error() == Some(110) {
+                    debug!(remote_addr = %addr, "Keepalive timeout — peer unreachable, closing");
+                } else {
+                    error!(remote_addr = %addr, error = %e, "Read error");
+                }
+                break;
+            }
+            Err(_) => { warn!(remote_addr = %addr, "Idle timeout — closing stale connection"); break; }
         };
 
         if request_buf.len() + n > MAX_REQUEST_SIZE {
@@ -397,6 +424,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     loop {
         match listener.accept().await {
             Ok((socket, addr)) => {
+                apply_keepalive(&socket);
                 tokio::spawn(handle_connection(
                     socket,
                     addr,

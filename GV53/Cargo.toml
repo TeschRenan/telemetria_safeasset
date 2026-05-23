@@ -12,6 +12,7 @@ aws-sdk-sqs = { version = "1.74.0" }
 dotenv      = "0.15"
 chrono      = "0.4.44"
 tracing     = "0.1.44"
+socket2     = { version = "0.5", features = ["all"] }
 
 [dependencies.tokio]
 version  = "1.20.1"
