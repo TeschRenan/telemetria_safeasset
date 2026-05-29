@@ -128,9 +128,11 @@ async fn save_last_transmission(
         .unwrap_or((0.0, 0.0));
 
     let ignition_status = reported.get("239").unwrap_or(&Value::from(0)).clone();
+    let speed = reported.get("24").unwrap_or(&Value::from(0)).clone(); 
 
     let data = json!({
         "imei":              imei,
+        "speed":             speed,
         "latitude":          latitude,
         "longitude":         longitude,
         "ignition_status":   ignition_status,

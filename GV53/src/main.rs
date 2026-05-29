@@ -343,7 +343,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let log_dir = env::var("LOG_DIR").unwrap_or_else(|_| "./logs".to_string());
     fs::create_dir_all(&log_dir)?;
 
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "gv57.log");
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "gv53.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
     tracing_subscriber::registry()

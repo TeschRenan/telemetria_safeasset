@@ -225,7 +225,7 @@ async fn handle_connection(
     let mut request_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut imei: Option<String> = None;
 
-    // Queclink GV350 envia mensagens AT diretamente — sem handshake de IMEI.
+    // Queclink GV57 envia mensagens AT diretamente — sem handshake de IMEI.
     // O IMEI é extraído de parts[2] da primeira mensagem válida.
     loop {
         let n = match timeout(IDLE_TIMEOUT, socket.read(&mut buffer)).await {
