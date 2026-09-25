@@ -138,16 +138,16 @@ async fn update_ignition_status(
     }
 }
 
-// Extrai lat/lon/speed do GTERI: parts[9]=speed, parts[12]=lon, parts[13]=lat (protocolo Queclink)
+// Extrai lat/lon/speed do GTFRI: parts[8]=speed, parts[11]=lon, parts[12]=lat (protocolo Queclink — GV50 usa GTFRI, não GTERI)
 fn parse_gteri_lat_lon(payload: &str) -> Option<(f64, f64, f64)> {
     let dollar_idx = payload.find('$').unwrap_or(payload.len());
     let parts: Vec<&str> = payload[..dollar_idx].split(',').collect();
-    if parts.len() < 14 {
+    if parts.len() < 13 {
         return None;
     }
-    let speed = parts[9].trim().parse::<f64>().unwrap_or(0.0);
-    let lon = parts[12].trim().parse::<f64>().ok()?;
-    let lat = parts[13].trim().parse::<f64>().ok()?;
+    let speed = parts[8].trim().parse::<f64>().unwrap_or(0.0);
+    let lon = parts[11].trim().parse::<f64>().ok()?;
+    let lat = parts[12].trim().parse::<f64>().ok()?;
     Some((lat, lon, speed))
 }
 
@@ -157,7 +157,7 @@ async fn save_last_transmission(
     payload:        &str,
     ignition_status: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    if !payload.contains("GTERI") {
+    if !payload.contains("GTFRI") {
         return Ok(());
     }
 
@@ -345,7 +345,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let log_dir = env::var("LOG_DIR").unwrap_or_else(|_| "./logs".to_string());
     fs::create_dir_all(&log_dir)?;
 
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "gv53.log");
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "gv50.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
     tracing_subscriber::registry()
@@ -381,7 +381,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
-    info!("Starting GV53 TCP Server");
+    info!("Starting GV50 TCP Server");
 
     from_filename(Path::new(".env")).ok();
 
@@ -421,7 +421,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // TCP listener
-    let address  = "0.0.0.0:50001";
+    let address  = "0.0.0.0:50000";
     let listener = TcpListener::bind(address).await?;
     info!(address = address, "TCP listener bound");
 

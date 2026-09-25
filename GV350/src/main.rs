@@ -138,16 +138,17 @@ async fn update_ignition_status(
     }
 }
 
-// Extrai lat/lon do GTERI: parts[13]=lat, parts[12]=lon (protocolo Queclink)
-fn parse_gteri_lat_lon(payload: &str) -> Option<(f64, f64)> {
+// Extrai lat/lon/speed do GTERI: parts[9]=speed, parts[12]=lon, parts[13]=lat (protocolo Queclink)
+fn parse_gteri_lat_lon(payload: &str) -> Option<(f64, f64, f64)> {
     let dollar_idx = payload.find('$').unwrap_or(payload.len());
     let parts: Vec<&str> = payload[..dollar_idx].split(',').collect();
     if parts.len() < 14 {
         return None;
     }
+    let speed = parts[9].trim().parse::<f64>().unwrap_or(0.0);
     let lon = parts[12].trim().parse::<f64>().ok()?;
     let lat = parts[13].trim().parse::<f64>().ok()?;
-    Some((lat, lon))
+    Some((lat, lon, speed))
 }
 
 async fn save_last_transmission(
@@ -160,12 +161,13 @@ async fn save_last_transmission(
         return Ok(());
     }
 
-    let (latitude, longitude) = parse_gteri_lat_lon(payload).unwrap_or((0.0, 0.0));
+    let (latitude, longitude, speed) = parse_gteri_lat_lon(payload).unwrap_or((0.0, 0.0, 0.0));
 
     let ign_int: i32 = ignition_status.parse().unwrap_or(0);
 
     let data = json!({
         "imei":              imei,
+        "speed":             speed,
         "latitude":          latitude,
         "longitude":         longitude,
         "ignition_status":   ign_int,

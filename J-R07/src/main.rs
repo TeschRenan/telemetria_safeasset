@@ -11,9 +11,9 @@ use std::fs;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
+use tokio::sync::mpsc;
 
 use socket2::{Socket, TcpKeepalive};
-use tokio::sync::mpsc;
 
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
@@ -31,18 +31,96 @@ const MAX_REQUEST_SIZE: usize = 65536;
 const BUFFER_SIZE: usize = 2048;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600); // fecha conexão sem dados por 10 min
 
+const FRAME_START: u8 = b'~';
+const FRAME_END:   u8 = b'$';
+
+// --- Protocolo J-R07 ---
+// Formato: ~MASCARA;campo1;campo2;...;$
+// A máscara (hex, 64 bits) indica quais IDs estão presentes: bit N ativo => ID N+1 presente.
+// Ex.: "0000000007FFFFFF" (bits 0..26) => IDs 1..27, na ordem crescente de ID.
+// O payload segue raw para o lambda; aqui só extraímos o necessário para auth e Redis.
+
+const ID_IMEI:      u32 = 2;
+const ID_LATITUDE:  u32 = 6;
+const ID_LONGITUDE: u32 = 7;
+const ID_SPEED:     u32 = 10;
+const ID_IGNITION:  u32 = 15;
+const ID_IO_STATE:  u32 = 28; // bit 0 = entrada digital 1 (ignição)
+
+struct Jr07Message {
+    imei:      Option<String>,
+    latitude:  f64,
+    longitude: f64,
+    speed:     f64,
+    ignition:  i64,
+}
+
+fn parse_jr07(message: &str) -> Result<Jr07Message, String> {
+    let body = message
+        .trim()
+        .trim_start_matches('~')
+        .trim_end_matches('$');
+
+    let mut parts: Vec<&str> = body.split(';').map(|s| s.trim()).collect();
+    // A string termina com ";$", o que gera um último campo vazio
+    if parts.last() == Some(&"") {
+        parts.pop();
+    }
+
+    let (mask_str, values) = parts.split_first().ok_or("Empty message")?;
+    let mask = u64::from_str_radix(mask_str, 16)
+        .map_err(|e| format!("Invalid mask '{}': {}", mask_str, e))?;
+
+    let expected = mask.count_ones() as usize;
+    if values.len() != expected {
+        return Err(format!(
+            "Field count mismatch: mask {} expects {} values, got {}",
+            mask_str, expected, values.len()
+        ));
+    }
+
+    // Posição do valor de um ID = quantidade de bits ativos abaixo dele
+    let get = |id: u32| -> Option<&str> {
+        let n = id - 1;
+        if (mask >> n) & 1 == 0 {
+            return None;
+        }
+        let idx = (mask & ((1u64 << n) - 1)).count_ones() as usize;
+        values.get(idx).copied()
+    };
+    let num = |id: u32| get(id).and_then(|v| v.parse::<f64>().ok());
+
+    // Ignição: campo 15; na ausência, bit 0 do Estado I/O
+    let ignition = get(ID_IGNITION)
+        .and_then(|v| v.parse::<i64>().ok())
+        .or_else(|| get(ID_IO_STATE).and_then(|v| v.parse::<i64>().ok()).map(|io| io & 1))
+        .unwrap_or(0);
+
+    Ok(Jr07Message {
+        imei:      get(ID_IMEI).filter(|s| is_valid_imei(s)).map(|s| s.to_string()),
+        latitude:  num(ID_LATITUDE).unwrap_or(0.0),
+        longitude: num(ID_LONGITUDE).unwrap_or(0.0),
+        speed:     num(ID_SPEED).unwrap_or(0.0),
+        ignition,
+    })
+}
+
+fn is_valid_imei(imei: &str) -> bool {
+    imei.len() == 15 && imei.chars().all(|c| c.is_ascii_digit())
+}
+
 fn apply_keepalive(stream: &TcpStream) {
     let fd = stream.as_raw_fd();
     // Safety: apenas configura opções no fd, sem transferir ownership
     let socket = unsafe { Socket::from_raw_fd(fd) };
     let ka = TcpKeepalive::new()
-        .with_time(Duration::from_secs(60))     // inicia probes após 60s idle
-        .with_interval(Duration::from_secs(10)) // probe a cada 10s
-        .with_retries(3);                        // 3 falhas → fecha socket
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(10))
+        .with_retries(3);
     if let Err(e) = socket.set_tcp_keepalive(&ka) {
         warn!(error = %e, "Failed to set TCP keepalive");
     }
-    std::mem::forget(socket); // não fechar o fd — Tokio ainda é dono
+    std::mem::forget(socket);
 }
 
 struct Stats {
@@ -112,65 +190,17 @@ async fn get_device_auth(redis: &mut ConnectionManager, imei: &str) -> String {
     redis.get::<_, String>(imei).await.unwrap_or_default()
 }
 
-async fn get_ignition_status(redis: &mut ConnectionManager, imei: &str) -> String {
-    let key = format!("{}/ign_status", imei);
-    redis.get::<_, String>(&key).await.unwrap_or_else(|_| "0".to_string())
-}
-
-async fn update_ignition_status(
-    redis:   &mut ConnectionManager,
-    imei:    &str,
-    payload: &str,
-) {
-    let value = if payload.contains("GTIGN") {
-        "1"
-    } else if payload.contains("GTIGF") {
-        "0"
-    } else {
-        return;
-    };
-
-    let key = format!("{}/ign_status", imei);
-    if let Err(e) = redis.set::<_, _, ()>(&key, value).await {
-        warn!(imei = %imei, error = %e, "Failed to update ign_status");
-    } else {
-        info!(imei = %imei, ign_status = %value, "Ignition status updated");
-    }
-}
-
-// Extrai lat/lon/speed do GTERI: parts[9]=speed, parts[12]=lon, parts[13]=lat (protocolo Queclink)
-fn parse_gteri_lat_lon(payload: &str) -> Option<(f64, f64, f64)> {
-    let dollar_idx = payload.find('$').unwrap_or(payload.len());
-    let parts: Vec<&str> = payload[..dollar_idx].split(',').collect();
-    if parts.len() < 14 {
-        return None;
-    }
-    let speed = parts[9].trim().parse::<f64>().unwrap_or(0.0);
-    let lon = parts[12].trim().parse::<f64>().ok()?;
-    let lat = parts[13].trim().parse::<f64>().ok()?;
-    Some((lat, lon, speed))
-}
-
 async fn save_last_transmission(
-    redis:          &mut ConnectionManager,
-    imei:           &str,
-    payload:        &str,
-    ignition_status: &str,
+    redis: &mut ConnectionManager,
+    imei:  &str,
+    msg:   &Jr07Message,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    if !payload.contains("GTERI") {
-        return Ok(());
-    }
-
-    let (latitude, longitude, speed) = parse_gteri_lat_lon(payload).unwrap_or((0.0, 0.0, 0.0));
-
-    let ign_int: i32 = ignition_status.parse().unwrap_or(0);
-
     let data = json!({
         "imei":              imei,
-        "speed":             speed,
-        "latitude":          latitude,
-        "longitude":         longitude,
-        "ignition_status":   ign_int,
+        "speed":             msg.speed,
+        "latitude":          msg.latitude,
+        "longitude":         msg.longitude,
+        "ignition_status":   msg.ignition,
         "last_transmission": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     });
 
@@ -186,7 +216,9 @@ async fn flush_pending_updates(socket: &mut TcpStream, redis: &mut ConnectionMan
     let values: Result<Vec<String>, _> = redis.lrange(&update_key, 0, 100).await;
     match values {
         Ok(list) if !list.is_empty() => {
+            info!(imei = %imei, pending = list.len(), "Pending commands found");
             if let Some(content) = list.first() {
+                info!(imei = %imei, command = %content, "Sending command to device");
                 if let Err(e) = socket.write_all(content.as_bytes()).await {
                     error!(imei = %imei, error = %e, "Failed to write update to device");
                     return;
@@ -197,6 +229,7 @@ async fn flush_pending_updates(socket: &mut TcpStream, redis: &mut ConnectionMan
                     .await;
                 let verify_key = format!("{}/verify_ack", imei);
                 let _: Result<(), _> = redis.set::<_, _, ()>(&verify_key, "1").await;
+                info!(imei = %imei, command = %content, "Command sent and verify_ack set");
             }
         }
         Ok(_)  => debug!(imei = %imei, "No pending updates"),
@@ -204,31 +237,51 @@ async fn flush_pending_updates(socket: &mut TcpStream, redis: &mut ConnectionMan
     }
 }
 
-fn extract_imei(payload: &str) -> Option<String> {
-    let dollar_idx = payload.find('$').unwrap_or(payload.len());
-    let parts: Vec<&str> = payload[..dollar_idx].split(',').collect();
-    let imei = parts.get(2).map(|s| s.trim().to_string()).filter(|s| s.len() == 15 && s.chars().all(|c| c.is_ascii_digit()));
-    imei
+// Remove do buffer a próxima mensagem completa "~...$", descartando lixo anterior ao '~'
+fn next_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let start = match buf.iter().position(|&b| b == FRAME_START) {
+        Some(pos) => pos,
+        None => {
+            buf.clear();
+            return None;
+        }
+    };
+    if start > 0 {
+        buf.drain(..start);
+    }
+    let end = buf.iter().position(|&b| b == FRAME_END)?;
+    let frame = buf[..=end].to_vec();
+    buf.drain(..=end);
+    Some(frame)
 }
 
 async fn handle_connection(
-    mut socket: TcpStream,
-    addr:       SocketAddr,
-    mut redis:  ConnectionManager,
-    sqs_tx:     mpsc::UnboundedSender<String>,
-    stats:      Arc<Stats>,
+    mut socket:   TcpStream,
+    addr:         SocketAddr,
+    redis_client: Arc<redis::Client>,
+    sqs_tx:       mpsc::UnboundedSender<String>,
+    stats:        Arc<Stats>,
 ) {
     stats.active.fetch_add(1, Ordering::Relaxed);
     let _guard = ActiveGuard(stats.clone());
 
     info!(remote_addr = %addr, "New connection accepted");
 
-    let mut buffer     = [0u8; BUFFER_SIZE];
+    // Conexão Redis dedicada para este handler — sem contenção com outros dispositivos
+    let mut redis = match ConnectionManager::new((*redis_client).clone()).await {
+        Ok(cm) => cm,
+        Err(e) => {
+            error!(remote_addr = %addr, error = %e, "Failed to create Redis connection");
+            return;
+        }
+    };
+
+    let mut buffer      = [0u8; BUFFER_SIZE];
     let mut request_buf: Vec<u8> = Vec::with_capacity(4096);
+
+    // J-R07 não faz handshake de IMEI — ele é extraído do campo 2 da primeira mensagem válida
     let mut imei: Option<String> = None;
 
-    // Queclink GV350 envia mensagens AT diretamente — sem handshake de IMEI.
-    // O IMEI é extraído de parts[2] da primeira mensagem válida.
     loop {
         let n = match timeout(IDLE_TIMEOUT, socket.read(&mut buffer)).await {
             Ok(Ok(0)) => { debug!(remote_addr = %addr, "Connection closed by device"); break; }
@@ -245,8 +298,7 @@ async fn handle_connection(
         };
 
         if request_buf.len() + n > MAX_REQUEST_SIZE {
-            let preview = std::str::from_utf8(&request_buf)
-                .unwrap_or("<binary>")
+            let preview = String::from_utf8_lossy(&request_buf)
                 .chars()
                 .take(200)
                 .collect::<String>();
@@ -256,86 +308,75 @@ async fn handle_connection(
         }
         request_buf.extend_from_slice(&buffer[..n]);
 
-        // Processa todas as mensagens completas no buffer (cada uma termina em '$')
-        while let Some(end_pos) = request_buf.iter().position(|&b| b == b'$') {
-            let message_bytes = request_buf[..=end_pos].to_vec();
-            request_buf.drain(..=end_pos);
-
-            let payload_str = match std::str::from_utf8(&message_bytes) {
+        // Processa todas as mensagens completas no buffer
+        while let Some(frame) = next_frame(&mut request_buf) {
+            let payload_str = match std::str::from_utf8(&frame) {
                 Ok(s) => s.trim_end_matches('\0').trim().to_string(),
                 Err(_) => {
-                    warn!(remote_addr = %addr, bytes = message_bytes.len(), "Binary data received — discarding message");
+                    warn!(remote_addr = %addr, bytes = frame.len(), "Binary data received — discarding message");
                     continue;
                 }
             };
 
-            if payload_str.is_empty() {
-                continue;
-            }
-
-            if payload_str.contains("+ACK") {
-                debug!(remote_addr = %addr, "ACK message ignored");
-                continue;
-            }
-
-            if !payload_str.contains("+RESP") && !payload_str.contains("+BUF") {
-                debug!(remote_addr = %addr, payload = %payload_str, "Unknown message format, skipping");
-                continue;
-            }
-
-            // Extrai o IMEI da primeira mensagem válida e mantém para as demais
-            if imei.is_none() {
-                match extract_imei(&payload_str) {
-                    Some(extracted) => {
-                        info!(remote_addr = %addr, imei = %extracted, "IMEI identified from first message");
-                        imei = Some(extracted);
-                    }
-                    None => {
-                        warn!(remote_addr = %addr, payload = %payload_str, "Could not extract IMEI, skipping");
-                        continue;
-                    }
+            let msg = match parse_jr07(&payload_str) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(remote_addr = %addr, error = %e, payload = %payload_str, "Failed to parse J-R07 message");
+                    stats.errors.fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
-            }
+            };
 
-            let imei = imei.as_deref().unwrap();
+            let current = match (&imei, msg.imei.clone()) {
+                // Primeira mensagem: registra IMEI e autentica uma única vez por conexão
+                (None, Some(extracted)) => {
+                    info!(remote_addr = %addr, imei = %extracted, "IMEI registered");
+                    let device_id = get_device_auth(&mut redis, &extracted).await;
+                    if device_id.is_empty() {
+                        warn!(imei = %extracted, "Device not authorized, closing connection");
+                        return;
+                    }
+                    imei = Some(extracted.clone());
+                    extracted
+                }
+                (None, None) => {
+                    warn!(remote_addr = %addr, payload = %payload_str, "Could not extract IMEI, skipping");
+                    continue;
+                }
+                (Some(known), Some(extracted)) if *known != extracted => {
+                    warn!(imei = %known, received = %extracted, "IMEI changed within connection, skipping");
+                    stats.errors.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                (Some(known), _) => known.clone(),
+            };
 
-            // Guard rail: autenticação re-verificada a cada payload
-            let device_id = get_device_auth(&mut redis, imei).await;
-            if device_id.is_empty() {
-                warn!(imei = %imei, "Device not authorized");
-                stats.errors.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
+            info!(imei = %current, payload = %payload_str, "Payload Received");
 
-            info!(imei = %imei, payload = %payload_str, "Payload received");
-
-            // Atualiza ign_status no Redis apenas para GTIGN e GTIGF
-            update_ignition_status(&mut redis, imei, &payload_str).await;
-
-            // Lê ignição atual do Redis (após possível atualização acima)
-            let ign_status = get_ignition_status(&mut redis, imei).await;
-
-            // Salva last_transmission no Redis apenas para GTERI
-            if let Err(e) = save_last_transmission(&mut redis, imei, &payload_str, &ign_status).await {
-                warn!(imei = %imei, error = %e, "Failed to save last transmission");
-            }
-
-            let to_send = json!({
-                "ignition": ign_status,
-                "payload":  payload_str,
-            })
-            .to_string();
-
-            info!( json = %to_send, "Payload sended");
-
-            if sqs_tx.send(to_send).is_ok() {
+            // O lambda recebe a string raw "~...$" exatamente como enviada pelo dispositivo
+            if sqs_tx.send(payload_str.clone()).is_ok() {
                 stats.processed.fetch_add(1, Ordering::Relaxed);
             } else {
-                error!(imei = %imei, "Failed to queue SQS message");
+                error!(imei = %current, "Failed to queue SQS message");
                 stats.errors.fetch_add(1, Ordering::Relaxed);
             }
 
-            flush_pending_updates(&mut socket, &mut redis, imei).await;
+            match tokio::time::timeout(
+                Duration::from_secs(3),
+                save_last_transmission(&mut redis, &current, &msg),
+            ).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!(imei = %current, error = %e, "Redis save_last_transmission failed"),
+                Err(_)     => warn!(imei = %current, "Redis save_last_transmission timed out"),
+            }
+
+            match tokio::time::timeout(
+                Duration::from_secs(3),
+                flush_pending_updates(&mut socket, &mut redis, &current),
+            ).await {
+                Ok(()) => {}
+                Err(_) => warn!(imei = %current, "flush_pending_updates timed out"),
+            }
         }
     }
 }
@@ -345,7 +386,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let log_dir = env::var("LOG_DIR").unwrap_or_else(|_| "./logs".to_string());
     fs::create_dir_all(&log_dir)?;
 
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "gv53.log");
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "jr07.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
     tracing_subscriber::registry()
@@ -381,15 +422,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
-    info!("Starting GV53 TCP Server");
+    info!("Starting J-R07 TCP Server");
 
     from_filename(Path::new(".env")).ok();
 
-    // Redis async — ConnectionManager é clonável e multiplexa sobre uma única conexão
+    // Redis — cada handler cria sua própria conexão dedicada (sem contenção)
     let redis_url    = env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379/".to_string());
-    let redis_client = redis::Client::open(redis_url.clone())?;
-    let redis        = ConnectionManager::new(redis_client).await?;
-    info!(redis_url = ?redis_url, "Redis async connection manager created");
+    let redis_client = Arc::new(redis::Client::open(redis_url.clone())?);
+    info!(redis_url = ?redis_url, "Redis client created");
 
     // Canal SQS async + task worker
     let (sqs_tx, sqs_rx) = mpsc::unbounded_channel::<String>();
@@ -421,7 +461,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // TCP listener
-    let address  = "0.0.0.0:50001";
+    let address  = "0.0.0.0:50006";
     let listener = TcpListener::bind(address).await?;
     info!(address = address, "TCP listener bound");
 
@@ -432,12 +472,62 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 tokio::spawn(handle_connection(
                     socket,
                     addr,
-                    redis.clone(),
+                    redis_client.clone(),
                     sqs_tx.clone(),
                     stats.clone(),
                 ));
             }
             Err(e) => error!(error = %e, "Error accepting connection"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Exemplo da seção 6 do manual (com espaços e quebras de linha como no PDF)
+    const MANUAL_EXAMPLE: &str = "~ 0000000007FFFFFF ;202401-00033-0010466;123456789012345;1234;teste1;1705687209759;
+-19.87417;-43.96894;840.45;3;60.99;12;31;1.21;270.25;1;0;12345.67;67543.21;118;1;
+2;13300;4200;TIM;4;1705687209759;1; $";
+
+    #[test]
+    fn parses_manual_example() {
+        let m = parse_jr07(MANUAL_EXAMPLE).unwrap();
+        assert_eq!(m.imei.as_deref(), Some("123456789012345"));
+        assert_eq!(m.latitude, -19.87417);
+        assert_eq!(m.longitude, -43.96894);
+        assert_eq!(m.speed, 60.99);
+        assert_eq!(m.ignition, 1);
+    }
+
+    #[test]
+    fn mask_skips_absent_ids() {
+        // IDs 2, 6, 7 e 28 (sem velocidade e sem ignição): ignição vem do bit 0 do Estado I/O
+        let mask: u64 = [2, 6, 7, 28].iter().map(|id| 1u64 << (id - 1)).sum();
+        let msg = format!("~{:016X};123456789012345;-1.5;-2.5;5;$", mask);
+        let m = parse_jr07(&msg).unwrap();
+        assert_eq!(m.imei.as_deref(), Some("123456789012345"));
+        assert_eq!(m.latitude, -1.5);
+        assert_eq!(m.longitude, -2.5);
+        assert_eq!(m.speed, 0.0);
+        assert_eq!(m.ignition, 1);
+    }
+
+    #[test]
+    fn rejects_field_count_mismatch() {
+        assert!(parse_jr07("~0000000000000007;a;b;$").is_err());
+        assert!(parse_jr07("~ZZZ;a;$").is_err());
+    }
+
+    #[test]
+    fn frames_split_across_reads() {
+        let mut buf = b"lixo~0000000000000002;123456789012345;$~00000000000".to_vec();
+        let f1 = next_frame(&mut buf).unwrap();
+        assert_eq!(f1, b"~0000000000000002;123456789012345;$");
+        assert!(next_frame(&mut buf).is_none());
+        buf.extend_from_slice(b"00002;123456789012345;$");
+        assert!(next_frame(&mut buf).is_some());
+        assert!(buf.is_empty());
     }
 }

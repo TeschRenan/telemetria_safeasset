@@ -144,6 +144,40 @@ async fn save_last_transmission(
     Ok(())
 }
 
+fn crc16_ibm(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0;
+    for &byte in data {
+        crc ^= byte as u16;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xA001;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    crc
+}
+
+fn build_codec12(command: &str) -> Vec<u8> {
+    let cmd_bytes = command.as_bytes();
+    let cmd_len = cmd_bytes.len() as u32;
+
+    let mut data = vec![0x0C, 0x01, 0x05];
+    data.extend_from_slice(&cmd_len.to_be_bytes());
+    data.extend_from_slice(cmd_bytes);
+    data.push(0x01);
+
+    let crc = crc16_ibm(&data) as u32;
+    let data_len = data.len() as u32;
+
+    let mut packet = vec![0x00, 0x00, 0x00, 0x00];
+    packet.extend_from_slice(&data_len.to_be_bytes());
+    packet.extend_from_slice(&data);
+    packet.extend_from_slice(&crc.to_be_bytes());
+    packet
+}
+
 // Envia ao dispositivo qualquer comando pendente na fila Redis e registra o ACK
 async fn flush_pending_updates(socket: &mut TcpStream, redis: &mut ConnectionManager, imei: &str) {
     let update_key = format!("{}/update", imei);
@@ -154,7 +188,8 @@ async fn flush_pending_updates(socket: &mut TcpStream, redis: &mut ConnectionMan
             info!(imei = %imei, pending = list.len(), "Pending commands found");
             if let Some(content) = list.first() {
                 info!(imei = %imei, command = %content, "Sending command to device");
-                if let Err(e) = socket.write_all(content.as_bytes()).await {
+                let packet = build_codec12(content);
+                if let Err(e) = socket.write_all(&packet).await {
                     error!(imei = %imei, error = %e, "Failed to write update to device");
                     return;
                 }
