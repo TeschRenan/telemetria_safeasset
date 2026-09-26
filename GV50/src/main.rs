@@ -30,6 +30,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 const MAX_REQUEST_SIZE: usize = 65536;
 const BUFFER_SIZE: usize = 2048;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600); // fecha conexão sem dados por 10 min
+const REDIS_TIMEOUT: Duration = Duration::from_secs(3);
+// Autenticação é revalidada periodicamente por conexão, em vez de um GET a cada payload
+const AUTH_RECHECK_AUTHORIZED: Duration = Duration::from_secs(600);
+const AUTH_RECHECK_DENIED:     Duration = Duration::from_secs(60);
 
 fn apply_keepalive(stream: &TcpStream) {
     let fd = stream.as_raw_fd();
@@ -108,33 +112,67 @@ async fn worker_sqs(mut rx: mpsc::UnboundedReceiver<String>) {
     }
 }
 
-async fn get_device_auth(redis: &mut ConnectionManager, imei: &str) -> String {
-    redis.get::<_, String>(imei).await.unwrap_or_default()
+// Some(autorizado) quando o Redis responde; None em erro/timeout (quem chama mantém o estado anterior)
+async fn check_device_auth(redis: &mut ConnectionManager, imei: &str) -> Option<bool> {
+    match timeout(REDIS_TIMEOUT, redis.get::<_, Option<String>>(imei)).await {
+        Ok(Ok(value)) => Some(value.is_some_and(|v| !v.is_empty())),
+        Ok(Err(e)) => { warn!(imei = %imei, error = %e, "Redis auth check failed"); None }
+        Err(_)     => { warn!(imei = %imei, "Redis auth check timed out"); None }
+    }
 }
 
-async fn get_ignition_status(redis: &mut ConnectionManager, imei: &str) -> String {
+struct AuthState {
+    authorized: bool,
+    checked_at: Option<Instant>,
+}
+
+impl AuthState {
+    fn new() -> Self {
+        Self { authorized: false, checked_at: None }
+    }
+
+    fn needs_check(&self) -> bool {
+        let interval = if self.authorized { AUTH_RECHECK_AUTHORIZED } else { AUTH_RECHECK_DENIED };
+        self.checked_at.map_or(true, |t| t.elapsed() >= interval)
+    }
+
+    async fn refresh(&mut self, redis: &mut ConnectionManager, imei: &str) {
+        if let Some(authorized) = check_device_auth(redis, imei).await {
+            if self.checked_at.is_none() || authorized != self.authorized {
+                info!(imei = %imei, authorized = authorized, "Device authorization checked");
+            }
+            self.authorized = authorized;
+            self.checked_at = Some(Instant::now());
+        }
+    }
+}
+
+// Estado inicial da ignição ao abrir a conexão; None em erro/timeout (tenta de novo no próximo payload)
+async fn load_ignition_status(redis: &mut ConnectionManager, imei: &str) -> Option<String> {
     let key = format!("{}/ign_status", imei);
-    redis.get::<_, String>(&key).await.unwrap_or_else(|_| "0".to_string())
+    match timeout(REDIS_TIMEOUT, redis.get::<_, Option<String>>(&key)).await {
+        Ok(Ok(value)) => Some(value.unwrap_or_else(|| "0".to_string())),
+        Ok(Err(e)) => { warn!(imei = %imei, error = %e, "Failed to load ign_status"); None }
+        Err(_)     => { warn!(imei = %imei, "Load ign_status timed out"); None }
+    }
 }
 
-async fn update_ignition_status(
-    redis:   &mut ConnectionManager,
-    imei:    &str,
-    payload: &str,
-) {
-    let value = if payload.contains("GTIGN") {
-        "1"
+fn ignition_event(payload: &str) -> Option<&'static str> {
+    if payload.contains("GTIGN") {
+        Some("1")
     } else if payload.contains("GTIGF") {
-        "0"
+        Some("0")
     } else {
-        return;
-    };
+        None
+    }
+}
 
+async fn save_ignition_status(redis: &mut ConnectionManager, imei: &str, value: &str) {
     let key = format!("{}/ign_status", imei);
-    if let Err(e) = redis.set::<_, _, ()>(&key, value).await {
-        warn!(imei = %imei, error = %e, "Failed to update ign_status");
-    } else {
-        info!(imei = %imei, ign_status = %value, "Ignition status updated");
+    match timeout(REDIS_TIMEOUT, redis.set::<_, _, ()>(&key, value)).await {
+        Ok(Ok(())) => info!(imei = %imei, ign_status = %value, "Ignition status updated"),
+        Ok(Err(e)) => warn!(imei = %imei, error = %e, "Failed to update ign_status"),
+        Err(_)     => warn!(imei = %imei, "Update ign_status timed out"),
     }
 }
 
@@ -179,29 +217,34 @@ async fn save_last_transmission(
     Ok(())
 }
 
-// Envia ao dispositivo qualquer comando pendente na fila Redis e registra o ACK
+// Envia ao dispositivo o comando mais antigo da fila e registra o ACK.
+// O backend enfileira com LPUSH, então o mais antigo fica no fim: lê com LINDEX -1 e só remove
+// (RPOP) depois de enviado. Se o envio falhar ou der timeout, o comando continua na fila.
 async fn flush_pending_updates(socket: &mut TcpStream, redis: &mut ConnectionManager, imei: &str) {
     let update_key = format!("{}/update", imei);
 
-    let values: Result<Vec<String>, _> = redis.lrange(&update_key, 0, 100).await;
-    match values {
-        Ok(list) if !list.is_empty() => {
-            if let Some(content) = list.first() {
-                if let Err(e) = socket.write_all(content.as_bytes()).await {
-                    error!(imei = %imei, error = %e, "Failed to write update to device");
-                    return;
-                }
-                let _: Result<Option<String>, _> = redis::cmd("RPOP")
-                    .arg(&update_key)
-                    .query_async(redis)
-                    .await;
-                let verify_key = format!("{}/verify_ack", imei);
-                let _: Result<(), _> = redis.set::<_, _, ()>(&verify_key, "1").await;
-            }
+    let content: String = match redis.lindex::<_, Option<String>>(&update_key, -1).await {
+        Ok(Some(content)) => content,
+        Ok(None) => {
+            debug!(imei = %imei, "No pending updates");
+            return;
         }
-        Ok(_)  => debug!(imei = %imei, "No pending updates"),
-        Err(e) => error!(imei = %imei, error = %e, "Failed to read pending updates"),
+        Err(e) => {
+            error!(imei = %imei, error = %e, "Failed to read pending updates");
+            return;
+        }
+    };
+
+    info!(imei = %imei, command = %content, "Sending command to device");
+    let packet = content.as_bytes().to_vec();
+    if let Err(e) = socket.write_all(&packet).await {
+        error!(imei = %imei, error = %e, "Failed to write update to device");
+        return;
     }
+    let _: Result<Option<String>, _> = redis.rpop(&update_key, None).await;
+    let verify_key = format!("{}/verify_ack", imei);
+    let _: Result<(), _> = redis.set::<_, _, ()>(&verify_key, "1").await;
+    info!(imei = %imei, command = %content, "Command sent and verify_ack set");
 }
 
 fn extract_imei(payload: &str) -> Option<String> {
@@ -226,6 +269,9 @@ async fn handle_connection(
     let mut buffer     = [0u8; BUFFER_SIZE];
     let mut request_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut imei: Option<String> = None;
+    let mut auth = AuthState::new();
+    // Só o TCP server grava {imei}/ign_status: lido do Redis uma vez por conexão e mantido em memória
+    let mut ign_cache: Option<String> = None;
 
     // Queclink GV350 envia mensagens AT diretamente — sem handshake de IMEI.
     // O IMEI é extraído de parts[2] da primeira mensagem válida.
@@ -299,9 +345,11 @@ async fn handle_connection(
 
             let imei = imei.as_deref().unwrap();
 
-            // Guard rail: autenticação re-verificada a cada payload
-            let device_id = get_device_auth(&mut redis, imei).await;
-            if device_id.is_empty() {
+            // Guard rail: autenticação revalidada periodicamente (10 min autorizado / 1 min negado)
+            if auth.needs_check() {
+                auth.refresh(&mut redis, imei).await;
+            }
+            if !auth.authorized {
                 warn!(imei = %imei, "Device not authorized");
                 stats.errors.fetch_add(1, Ordering::Relaxed);
                 continue;
@@ -309,16 +357,15 @@ async fn handle_connection(
 
             info!(imei = %imei, payload = %payload_str, "Payload received");
 
-            // Atualiza ign_status no Redis apenas para GTIGN e GTIGF
-            update_ignition_status(&mut redis, imei, &payload_str).await;
-
-            // Lê ignição atual do Redis (após possível atualização acima)
-            let ign_status = get_ignition_status(&mut redis, imei).await;
-
-            // Salva last_transmission no Redis apenas para GTERI
-            if let Err(e) = save_last_transmission(&mut redis, imei, &payload_str, &ign_status).await {
-                warn!(imei = %imei, error = %e, "Failed to save last transmission");
+            // Ignição: GTIGN/GTIGF definem o estado; nas demais usa o valor da conexão
+            // (lido do Redis só na primeira mensagem)
+            let ign_event = ignition_event(&payload_str);
+            if let Some(value) = ign_event {
+                ign_cache = Some(value.to_string());
+            } else if ign_cache.is_none() {
+                ign_cache = load_ignition_status(&mut redis, imei).await;
             }
+            let ign_status = ign_cache.clone().unwrap_or_else(|| "0".to_string());
 
             let to_send = json!({
                 "ignition": ign_status,
@@ -335,7 +382,21 @@ async fn handle_connection(
                 stats.errors.fetch_add(1, Ordering::Relaxed);
             }
 
-            flush_pending_updates(&mut socket, &mut redis, imei).await;
+            // Escritas no Redis só depois do SQS: Redis lento não atrasa a telemetria
+            if let Some(value) = ign_event {
+                save_ignition_status(&mut redis, imei, value).await;
+            }
+
+            // Salva last_transmission no Redis (apenas para a mensagem de posição do modelo)
+            match timeout(REDIS_TIMEOUT, save_last_transmission(&mut redis, imei, &payload_str, &ign_status)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!(imei = %imei, error = %e, "Failed to save last transmission"),
+                Err(_)     => warn!(imei = %imei, "Save last transmission timed out"),
+            }
+
+            if timeout(REDIS_TIMEOUT, flush_pending_updates(&mut socket, &mut redis, imei)).await.is_err() {
+                warn!(imei = %imei, "flush_pending_updates timed out");
+            }
         }
     }
 }

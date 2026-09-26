@@ -31,6 +31,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 const MAX_REQUEST_SIZE: usize = 65536;
 const BUFFER_SIZE: usize = 2048;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600); // fecha conexão sem dados por 10 min
+const REDIS_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn apply_keepalive(stream: &TcpStream) {
     let fd = stream.as_raw_fd();
@@ -110,7 +111,13 @@ async fn worker_sqs(mut rx: mpsc::UnboundedReceiver<String>) {
 }
 
 async fn get_device_auth(redis: &mut ConnectionManager, imei: &str) -> String {
-    redis.get::<_, String>(imei).await.unwrap_or_default()
+    match timeout(REDIS_TIMEOUT, redis.get::<_, String>(imei)).await {
+        Ok(result) => result.unwrap_or_default(),
+        Err(_) => {
+            warn!(imei = %imei, "Redis auth check timed out");
+            String::new()
+        }
+    }
 }
 
 async fn save_last_transmission(
@@ -178,33 +185,34 @@ fn build_codec12(command: &str) -> Vec<u8> {
     packet
 }
 
-// Envia ao dispositivo qualquer comando pendente na fila Redis e registra o ACK
+// Envia ao dispositivo o comando mais antigo da fila e registra o ACK.
+// O backend enfileira com LPUSH, então o mais antigo fica no fim: lê com LINDEX -1 e só remove
+// (RPOP) depois de enviado. Se o envio falhar ou der timeout, o comando continua na fila.
 async fn flush_pending_updates(socket: &mut TcpStream, redis: &mut ConnectionManager, imei: &str) {
     let update_key = format!("{}/update", imei);
 
-    let values: Result<Vec<String>, _> = redis.lrange(&update_key, 0, 100).await;
-    match values {
-        Ok(list) if !list.is_empty() => {
-            info!(imei = %imei, pending = list.len(), "Pending commands found");
-            if let Some(content) = list.first() {
-                info!(imei = %imei, command = %content, "Sending command to device");
-                let packet = build_codec12(content);
-                if let Err(e) = socket.write_all(&packet).await {
-                    error!(imei = %imei, error = %e, "Failed to write update to device");
-                    return;
-                }
-                let _: Result<Option<String>, _> = redis::cmd("RPOP")
-                    .arg(&update_key)
-                    .query_async(redis)
-                    .await;
-                let verify_key = format!("{}/verify_ack", imei);
-                let _: Result<(), _> = redis.set::<_, _, ()>(&verify_key, "1").await;
-                info!(imei = %imei, command = %content, "Command sent and verify_ack set");
-            }
+    let content: String = match redis.lindex::<_, Option<String>>(&update_key, -1).await {
+        Ok(Some(content)) => content,
+        Ok(None) => {
+            debug!(imei = %imei, "No pending updates");
+            return;
         }
-        Ok(_)  => debug!(imei = %imei, "No pending updates"),
-        Err(e) => error!(imei = %imei, error = %e, "Failed to read pending updates"),
+        Err(e) => {
+            error!(imei = %imei, error = %e, "Failed to read pending updates");
+            return;
+        }
+    };
+
+    info!(imei = %imei, command = %content, "Sending command to device");
+    let packet = build_codec12(&content);
+    if let Err(e) = socket.write_all(&packet).await {
+        error!(imei = %imei, error = %e, "Failed to write update to device");
+        return;
     }
+    let _: Result<Option<String>, _> = redis.rpop(&update_key, None).await;
+    let verify_key = format!("{}/verify_ack", imei);
+    let _: Result<(), _> = redis.set::<_, _, ()>(&verify_key, "1").await;
+    info!(imei = %imei, command = %content, "Command sent and verify_ack set");
 }
 
 async fn handle_connection(
@@ -220,10 +228,14 @@ async fn handle_connection(
     info!(remote_addr = %addr, "New connection accepted");
 
     // Conexão Redis dedicada para este handler — sem contenção com outros dispositivos
-    let mut redis = match ConnectionManager::new((*redis_client).clone()).await {
-        Ok(cm) => cm,
-        Err(e) => {
+    let mut redis = match timeout(REDIS_TIMEOUT, ConnectionManager::new((*redis_client).clone())).await {
+        Ok(Ok(cm)) => cm,
+        Ok(Err(e)) => {
             error!(remote_addr = %addr, error = %e, "Failed to create Redis connection");
+            return;
+        }
+        Err(_) => {
+            error!(remote_addr = %addr, "Redis connection timed out");
             return;
         }
     };
@@ -326,7 +338,7 @@ async fn handle_connection(
                 }
 
                 match tokio::time::timeout(
-                    Duration::from_secs(3),
+                    REDIS_TIMEOUT,
                     save_last_transmission(&mut redis, &imei, &json),
                 ).await {
                     Ok(Ok(())) => {}
@@ -335,7 +347,7 @@ async fn handle_connection(
                 }
 
                 match tokio::time::timeout(
-                    Duration::from_secs(3),
+                    REDIS_TIMEOUT,
                     flush_pending_updates(&mut socket, &mut redis, &imei),
                 ).await {
                     Ok(()) => {}

@@ -31,6 +31,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 const MAX_REQUEST_SIZE: usize = 65536;
 const BUFFER_SIZE: usize = 2048;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600); // fecha conexão sem dados por 10 min
+const REDIS_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn apply_keepalive(stream: &TcpStream) {
     let fd = stream.as_raw_fd();
@@ -110,7 +111,13 @@ async fn worker_sqs(mut rx: mpsc::UnboundedReceiver<String>) {
 }
 
 async fn get_device_auth(redis: &mut ConnectionManager, imei: &str) -> String {
-    redis.get::<_, String>(imei).await.unwrap_or_default()
+    match timeout(REDIS_TIMEOUT, redis.get::<_, String>(imei)).await {
+        Ok(result) => result.unwrap_or_default(),
+        Err(_) => {
+            warn!(imei = %imei, "Redis auth check timed out");
+            String::new()
+        }
+    }
 }
 
 async fn save_last_transmission(
@@ -178,30 +185,34 @@ fn build_codec12(command: &str) -> Vec<u8> {
     packet
 }
 
-// Envia ao dispositivo qualquer comando pendente na fila Redis e registra o ACK
+// Envia ao dispositivo o comando mais antigo da fila e registra o ACK.
+// O backend enfileira com LPUSH, então o mais antigo fica no fim: lê com LINDEX -1 e só remove
+// (RPOP) depois de enviado. Se o envio falhar ou der timeout, o comando continua na fila.
 async fn flush_pending_updates(socket: &mut TcpStream, redis: &mut ConnectionManager, imei: &str) {
     let update_key = format!("{}/update", imei);
 
-    let values: Result<Vec<String>, _> = redis.lrange(&update_key, 0, 100).await;
-    match values {
-        Ok(list) if !list.is_empty() => {
-            if let Some(content) = list.first() {
-                let packet = build_codec12(content);
-                if let Err(e) = socket.write_all(&packet).await {
-                    error!(imei = %imei, error = %e, "Failed to write update to device");
-                    return;
-                }
-                let _: Result<Option<String>, _> = redis::cmd("RPOP")
-                    .arg(&update_key)
-                    .query_async(redis)
-                    .await;
-                let verify_key = format!("{}/verify_ack", imei);
-                let _: Result<(), _> = redis.set::<_, _, ()>(&verify_key, "1").await;
-            }
+    let content: String = match redis.lindex::<_, Option<String>>(&update_key, -1).await {
+        Ok(Some(content)) => content,
+        Ok(None) => {
+            debug!(imei = %imei, "No pending updates");
+            return;
         }
-        Ok(_)  => debug!(imei = %imei, "No pending updates"),
-        Err(e) => error!(imei = %imei, error = %e, "Failed to read pending updates"),
+        Err(e) => {
+            error!(imei = %imei, error = %e, "Failed to read pending updates");
+            return;
+        }
+    };
+
+    info!(imei = %imei, command = %content, "Sending command to device");
+    let packet = build_codec12(&content);
+    if let Err(e) = socket.write_all(&packet).await {
+        error!(imei = %imei, error = %e, "Failed to write update to device");
+        return;
     }
+    let _: Result<Option<String>, _> = redis.rpop(&update_key, None).await;
+    let verify_key = format!("{}/verify_ack", imei);
+    let _: Result<(), _> = redis.set::<_, _, ()>(&verify_key, "1").await;
+    info!(imei = %imei, command = %content, "Command sent and verify_ack set");
 }
 
 async fn handle_connection(
@@ -241,6 +252,13 @@ async fn handle_connection(
         return;
     }
     debug!(imei = %imei, "ACK sent");
+
+    // --- Autenticação: feita uma única vez por conexão ---
+    let device_id = get_device_auth(&mut redis, &imei).await;
+    if device_id.is_empty() {
+        warn!(imei = %imei, "Device not authorized, closing connection");
+        return;
+    }
 
     // --- Fase 3: loop de payloads ---
     let mut request_buf: Vec<u8> = Vec::with_capacity(4096);
@@ -288,14 +306,6 @@ async fn handle_connection(
                     reported.insert("imei".to_string(), Value::String(imei.clone()));
                 }
 
-                // Guard rail: autenticação re-verificada a cada payload
-                let device_id = get_device_auth(&mut redis, &imei).await;
-                if device_id.is_empty() {
-                    warn!(imei = %imei, "Device not authorized");
-                    stats.errors.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-
                 info!(imei = %imei, payload = %json, "Payload Received");
 
                 let to_send = serde_json::to_string(&json).unwrap_or_default();
@@ -308,11 +318,15 @@ async fn handle_connection(
                     }
                 }
 
-                if let Err(e) = save_last_transmission(&mut redis, &imei, &json).await {
-                    warn!(imei = %imei, error = %e, "Failed to save last transmission");
+                match timeout(REDIS_TIMEOUT, save_last_transmission(&mut redis, &imei, &json)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!(imei = %imei, error = %e, "Redis save_last_transmission failed"),
+                    Err(_)     => warn!(imei = %imei, "Redis save_last_transmission timed out"),
                 }
 
-                flush_pending_updates(&mut socket, &mut redis, &imei).await;
+                if timeout(REDIS_TIMEOUT, flush_pending_updates(&mut socket, &mut redis, &imei)).await.is_err() {
+                    warn!(imei = %imei, "flush_pending_updates timed out");
+                }
             }
             Err(_) => {} // JSON incompleto: continua acumulando
         }
